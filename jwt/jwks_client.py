@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 
 from .api_jwk import PyJWK, PyJWKSet
 from .api_jwt import decode_complete as decode_token
-from .exceptions import PyJWKClientConnectionError, PyJWKClientError
+from .exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWTError
 from .jwk_set_cache import JWKSetCache
 
 
@@ -43,6 +43,7 @@ class PyJWKClient:
         timeout: float = 30,
         ssl_context: SSLContext | None = None,
         cooldown_duration: float = 30,
+        stale_ttl: float = 0,
     ):
         """A client for retrieving signing keys from a JWKS endpoint.
 
@@ -56,15 +57,27 @@ class PyJWKClient:
         - ``cache_jwk_set``: Set to ``True`` (the default) to enable this
           cache. When enabled, the JWK Set is fetched from the network only
           when the cache is empty or expired.
-        - ``lifespan``: Time in seconds before the cached JWK Set expires.
-          Defaults to ``300`` (5 minutes). Must be greater than 0.
+        - ``lifespan``: Time in seconds during which the cached JWK Set is
+          considered fresh. Defaults to ``300`` (5 minutes). Must be greater
+          than 0.
+        - ``stale_ttl``: Bounds how long an expired (stale) JWK Set may keep
+          being trusted after its ``lifespan`` has elapsed. When a refresh
+          fails because the endpoint is unreachable or returns an invalid
+          response, the stale set is still served until ``lifespan +
+          stale_ttl`` seconds have passed since it was cached. Once that hard
+          cutoff passes, the stale set is discarded and tokens can no longer
+          be verified against it, so a revoked key can never be trusted
+          indefinitely. A failed refresh never overwrites a usable set.
+          Defaults to ``0``, which disables stale fallback: an expired set
+          plus a failed refresh results in an error, matching the behavior of
+          clients that do not opt in.
 
         Unknown key IDs can trigger one forced refresh after the cooldown
-        period configured by ``cooldown_duration``. Every successful fetch
-        starts this cooldown, including the initial fetch and cache-expiry
-        fetches. A newly rotated key may therefore wait for the cooldown
-        period before it is fetched; set ``cooldown_duration`` to ``0`` to
-        disable this behavior. The cooldown is bypassed when
+        period configured by ``cooldown_duration``. Every fetch attempt
+        (successful or not) starts this cooldown, including the initial fetch
+        and cache-expiry fetches. A newly rotated key may therefore wait for
+        the cooldown period before it is fetched; set ``cooldown_duration``
+        to ``0`` to disable this behavior. The cooldown is bypassed when
         ``cache_jwk_set`` is ``False``.
 
         **Tier 2 — Signing key cache** (disabled by default):
@@ -96,6 +109,10 @@ class PyJWKClient:
         :param cooldown_duration: Minimum time in seconds between forced
             refreshes after an unknown key ID. Defaults to ``30``.
         :type cooldown_duration: float
+        :param stale_ttl: Maximum extra time in seconds that an expired JWK
+            Set remains trusted when a refresh fails. Defaults to ``0``
+            (fail immediately instead of serving stale keys).
+        :type stale_ttl: float
         """
         if headers is None:
             headers = {}
@@ -123,8 +140,21 @@ class PyJWKClient:
             raise PyJWKClientError(
                 f'Cooldown duration must be finite, the input is "{cooldown_duration}"'
             )
+        if stale_ttl < 0:
+            raise PyJWKClientError(
+                "Stale TTL must be greater than or equal to 0, "
+                f'the input is "{stale_ttl}"'
+            )
+        if not math.isfinite(stale_ttl):
+            raise PyJWKClientError(
+                f'Stale TTL must be finite, the input is "{stale_ttl}"'
+            )
         self.cooldown_duration = cooldown_duration
+        self.stale_ttl = stale_ttl
         self._last_successful_fetch: float | None = None
+        # Timestamp of the most recent fetch attempt, including failed
+        # ones, so a failing endpoint cannot bypass the refresh cooldown.
+        self._last_refresh_attempt: float | None = None
         self._client_lock = threading.RLock()
 
         if cache_jwk_set:
@@ -134,7 +164,7 @@ class PyJWKClient:
                 raise PyJWKClientError(
                     f'Lifespan must be greater than 0, the input is "{lifespan}"'
                 )
-            self.jwk_set_cache = JWKSetCache(lifespan)
+            self.jwk_set_cache = JWKSetCache(lifespan, stale_ttl=stale_ttl)
         else:
             self.jwk_set_cache = None
 
@@ -190,39 +220,84 @@ class PyJWKClient:
     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
         """Return the JWK Set, using the cache when available.
 
+        When the cache is enabled and a refresh fails (network error or an
+        invalid response from the endpoint), a previously cached set that is
+        still inside its stale window (``lifespan + stale_ttl``) is served
+        instead of propagating the failure. Once that window elapses the
+        stale set is no longer returned and the underlying error is raised.
+        A failed refresh never replaces the cached set, so one bad response
+        cannot discard a still-usable one. While a refresh cooldown is
+        active, an expired-but-still-trustable set is served without any
+        request at all.
+
         :param refresh: Force a fresh fetch from the endpoint, bypassing
-            the cache.
+            the fresh cache.
         :type refresh: bool
         :returns: The JWK Set.
         :rtype: PyJWKSet
         :raises PyJWKClientError: If the endpoint does not return a JSON
-            object.
+            object and no cached set is available within the stale window.
+        :raises PyJWKClientConnectionError: If the endpoint is unreachable
+            and no cached set is available within the stale window.
         """
-        data = None
-        fetched = False
-        if self.jwk_set_cache is not None and not refresh:
-            data = self.jwk_set_cache.get()
+        # Serialize refreshes across threads: without this, concurrent
+        # lookups against an expired/missing cache would each issue their
+        # own request, and a forced refresh could run while another one is
+        # in flight.
+        with self._client_lock:
+            data = None
+            fetched = False
+            if self.jwk_set_cache is not None and not refresh:
+                data = self.jwk_set_cache.get()
 
-        if data is None:
-            data = self.fetch_data()
-            fetched = True
+            if data is None:
+                # While a refresh cooldown is in force and a still-trustable
+                # stale set exists, serve it instead of issuing another
+                # request. This bounds the endpoint to at most one fetch per
+                # cooldown window during an outage or a rotation that has not
+                # propagated yet. A forced refresh bypasses this, and with
+                # stale_ttl=0 there is no stale set to fall back on.
+                if not refresh and self._is_cooling_down():
+                    stale = (
+                        self.jwk_set_cache.get_stale()
+                        if self.jwk_set_cache is not None
+                        else None
+                    )
+                    if stale is not None:
+                        return stale
+                try:
+                    data = self.fetch_data()
+                    fetched = True
+                except PyJWTError:
+                    # Do not let a single failed/invalid response wipe out a
+                    # still-trustable set. Serve the stale cache while the
+                    # hard cutoff (lifespan + stale_ttl) has not passed;
+                    # beyond it, revoke trust by re-raising.
+                    if self.jwk_set_cache is None:
+                        raise
+                    stale = self.jwk_set_cache.get_stale()
+                    if stale is None:
+                        raise
+                    return stale
+                finally:
+                    self._last_refresh_attempt = time.monotonic()
 
-        # A cache hit is already parsed, so serve it as-is. Only a fresh
-        # fetch reaches the check below, which still matters because
-        # `fetch_data()` may be overridden by a subclass.
-        if isinstance(data, PyJWKSet):
-            jwk_set = data
-        else:
-            jwk_set = PyJWKSet.from_dict(self._as_jwk_set_payload(data))
+            # A cache hit is already parsed, so serve it as-is. Only a fresh
+            # fetch reaches the check below, which still matters because
+            # `fetch_data()` may be overridden by a subclass.
+            if isinstance(data, PyJWKSet):
+                jwk_set = data
+            else:
+                jwk_set = PyJWKSet.from_dict(self._as_jwk_set_payload(data))
 
-        # `fetch_data()` caches the payload it received from the endpoint,
-        # but a subclass may filter or transform it before returning. Cache
-        # the value actually being returned, so later cache hits serve the
-        # same key set as this call rather than the pre-transform one.
-        if fetched and self.jwk_set_cache is not None:
-            self.jwk_set_cache.put(jwk_set)
+            # `fetch_data()` caches the payload it received from the endpoint,
+            # but a subclass may filter or transform it before returning. Cache
+            # the value actually being returned, so later cache hits serve the
+            # same key set as this call rather than the pre-transform one.
+            if fetched and self.jwk_set_cache is not None:
+                self.jwk_set_cache.put(jwk_set)
 
-        return jwk_set
+            return jwk_set
 
     @staticmethod
     def _as_jwk_set_payload(data: Any) -> dict[str, Any]:
@@ -265,7 +340,8 @@ class PyJWKClient:
 
         If no match is found in the current JWK Set, the set is refreshed
         from the endpoint and the lookup is retried once when the refresh
-        cooldown permits it.
+        cooldown permits it. When the refresh fails but a stale set is
+        available within its trust window, the retry runs against that set.
 
         :param kid: The key ID to look up.
         :type kid: str
@@ -278,24 +354,31 @@ class PyJWKClient:
             signing_keys = self.get_signing_keys()
             signing_key = self.match_kid(signing_keys, kid)
 
-            if not signing_key:
-                cooling_down = (
-                    self.jwk_set_cache is not None
-                    and self._last_successful_fetch is not None
-                    and time.monotonic() - self._last_successful_fetch
-                    < self.cooldown_duration
-                )
-                if not cooling_down:
-                    signing_keys = self.get_signing_keys(refresh=True)
-                    self._last_successful_fetch = time.monotonic()
-                    signing_key = self.match_kid(signing_keys, kid)
+            if not signing_key and not self._is_cooling_down():
+                # A failed refresh is served from the stale set (or raises)
+                # inside get_jwk_set(); either way the cooldown was restarted
+                # by the attempt, so failures cannot trigger request storms.
+                signing_keys = self.get_signing_keys(refresh=True)
+                signing_key = self.match_kid(signing_keys, kid)
 
-                if not signing_key:
-                    raise PyJWKClientError(
-                        f'Unable to find a signing key that matches: "{kid}"'
-                    )
+            if not signing_key:
+                raise PyJWKClientError(
+                    f'Unable to find a signing key that matches: "{kid}"'
+                )
 
             return signing_key
+
+    def _is_cooling_down(self) -> bool:
+        """Whether a forced refresh is currently blocked by the cooldown.
+
+        The cooldown is measured from the most recent fetch *attempt*, so a
+        failing endpoint restarts it just like a successful one and repeated
+        unknown-``kid`` lookups during an outage make at most one request per
+        cooldown window. It only applies while the JWK Set cache is enabled.
+        """
+        if self.jwk_set_cache is None or self._last_refresh_attempt is None:
+            return False
+        return time.monotonic() - self._last_refresh_attempt < self.cooldown_duration
 
     def get_signing_key_from_jwt(self, token: str | bytes) -> PyJWK:
         """Return the signing key for a JWT by reading its ``kid`` header.

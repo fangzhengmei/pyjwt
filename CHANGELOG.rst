@@ -7,9 +7,32 @@ This project adheres to `Semantic Versioning <https://semver.org/>`__.
 `Unreleased <https://github.com/jpadilla/pyjwt/compare/2.15.1...HEAD>`__
 -------------------------------------------------------------------------
 
+Added
+~~~~~
+
+- ``PyJWKClient`` and ``JWKSetCache`` now accept a ``stale_ttl`` parameter
+  that bounds how long an expired JWK Set remains trusted when a refresh
+  fails. A cached set is served as stale for at most ``lifespan +
+  stale_ttl`` seconds after it was fetched; after that hard cutoff the
+  underlying error is raised, so a revoked key can never be trusted
+  indefinitely. The default of ``0`` preserves the previous fail-fast
+  behavior.
+
 Changed
 ~~~~~~~
 
+- Failed JWKS refreshes (a connection error or an invalid endpoint
+  response) no longer replace a usable cached set. When ``stale_ttl`` is
+  configured, the stale set is served instead of propagating the failure
+  until its trust window elapses; one bad response can no longer break
+  verification of tokens whose keys are still within that window.
+- The unknown-``kid`` refresh cooldown is now measured from the most recent
+  fetch *attempt*, including failed ones, rather than only successful
+  fetches. A failing endpoint therefore restarts the cooldown and repeated
+  lookups make at most one request per cooldown window; while the cooldown
+  is active an expired but still-trustable set is served without any
+  request. Refreshes continue to be serialized by the client lock, so
+  concurrent misses issue a single request and share its result.
 - Add public ``jwt.decode`` regression coverage for AWS ALB-style padded
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.

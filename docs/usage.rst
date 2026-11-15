@@ -512,11 +512,40 @@ verification; do not infer that relationship from those JWK members alone.
 
 If the ``kid`` is not found in the current key set, ``PyJWKClient``
 automatically refreshes the JWKS from the endpoint and retries before raising
-an error.
+an error. Forced refreshes are rate-limited by the ``cooldown_duration``
+parameter (default 30 seconds): every fetch attempt, including a failed one,
+starts the cooldown, so an outage or a stream of tokens with unknown key IDs
+can trigger at most one refresh per cooldown window. Set
+``cooldown_duration`` to ``0`` to refresh on every miss.
 
 ``PyJWKClient`` also includes built-in caching to avoid unnecessary network
 requests. See :class:`~jwt.PyJWKClient` in the API reference for details on
 the caching parameters.
+
+Key rotation and the stale key trust window
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The cached JWKS is considered fresh for ``lifespan`` seconds (default 300).
+After it expires, the next lookup fetches a fresh set from the endpoint. If
+that refresh fails because the endpoint is temporarily unreachable or returns
+an invalid response, a previously cached set can still be used to verify
+tokens while it remains inside an explicit trust window: configure
+``stale_ttl`` to bound how long an expired set may keep being trusted. A set
+cached at time *t* is accepted at most until *t + lifespan + stale_ttl*, no
+matter how long the outage lasts, so a key that has been removed from the
+endpoint can never be trusted indefinitely. Once that hard cutoff passes,
+lookups raise the underlying error instead of serving the stale set.
+
+A failed refresh never overwrites the cached set, so one invalid response
+cannot discard a still-usable one. ``stale_ttl`` defaults to ``0``, which
+disables stale fallback and preserves the fail-fast behavior: an expired set
+combined with a failed refresh results in an error.
+
+.. code-block:: python
+
+    # Trust the previous set for up to 10 minutes after it expires while
+    # the JWKS endpoint is failing; refuse tokens afterwards.
+    jwks_client = PyJWKClient(url, lifespan=300, stale_ttl=600)
 
 OIDC Login Flow
 ---------------

@@ -536,6 +536,276 @@ class TestPyJWKClient:
             jwks_client.get_jwk_set()
         assert call.call_count == 0
 
+    @pytest.mark.parametrize("stale_ttl", [float("nan"), float("inf"), -1.0])
+    def test_client_rejects_invalid_stale_ttl(self, stale_ttl: float) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        with pytest.raises(PyJWKClientError, match="Stale TTL"):
+            PyJWKClient(url, stale_ttl=stale_ttl)
+
+    def test_cache_get_stale_none_without_stale_window(self) -> None:
+        # With the default stale_ttl of 0, an expired set must not be
+        # served as stale, preserving the pre-opt-in behavior.
+        cache = JWKSetCache(lifespan=1, stale_ttl=0)
+        cache.put(RESPONSE_DATA_WITH_MATCHING_KID)
+        assert cache.jwk_set_with_timestamp is not None
+
+        cache.jwk_set_with_timestamp.timestamp = time.monotonic() - 2
+        assert cache.get() is None
+        assert cache.get_stale() is None
+
+    def test_cache_get_stale_serves_within_window_and_cuts_off_after(self) -> None:
+        cache = JWKSetCache(lifespan=10, stale_ttl=20)
+        cache.put(RESPONSE_DATA_WITH_MATCHING_KID)
+        assert cache.jwk_set_with_timestamp is not None
+
+        # Fresh: both get() and get_stale() serve the set.
+        cache.jwk_set_with_timestamp.timestamp = time.monotonic() - 5
+        assert cache.get() is not None
+        assert cache.get_stale() is not None
+        # Stale but inside the hard cutoff (10 + 20 = 30).
+        cache.jwk_set_with_timestamp.timestamp = time.monotonic() - 15
+        assert cache.get() is None
+        assert cache.get_stale() is not None
+        # Past the hard cutoff: trust is revoked.
+        cache.jwk_set_with_timestamp.timestamp = time.monotonic() - 31
+        assert cache.get() is None
+        assert cache.get_stale() is None
+
+    def test_cache_rejects_invalid_stale_ttl(self) -> None:
+        with pytest.raises(PyJWKClientError, match="Stale TTL"):
+            JWKSetCache(lifespan=10, stale_ttl=-1)
+
+    def _client_with_aged_cache(
+        self,
+        lifespan: float,
+        stale_ttl: float,
+        age: float,
+        cooldown_duration: float = 0,
+    ) -> PyJWKClient:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(
+            url,
+            lifespan=lifespan,
+            stale_ttl=stale_ttl,
+            cooldown_duration=cooldown_duration,
+        )
+        assert jwks_client.jwk_set_cache is not None
+
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            jwks_client.get_jwk_set()
+
+        # Age the cached set by moving its stored timestamp back, rather
+        # than mocking the clock, so the age is independent of which module
+        # reads time.monotonic().
+        assert jwks_client.jwk_set_cache.jwk_set_with_timestamp is not None
+        jwks_client.jwk_set_cache.jwk_set_with_timestamp.timestamp = (
+            time.monotonic() - age
+        )
+        assert jwks_client.jwk_set_cache.get() is None
+        return jwks_client
+
+    def test_failed_refresh_serves_stale_set_within_trust_window(self) -> None:
+        # Endpoint down after the cache expired: old keys remain trusted
+        # until the hard cutoff, so in-flight tokens keep verifying.
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=20, age=15)
+
+        with mocked_failed_response() as call:
+            jwk_set = jwks_client.get_jwk_set()
+
+        assert call.call_count == 1
+        assert jwk_set[kid].key_id == kid
+
+        # The failed fetch must not have replaced the cached set.
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get_stale() is not None
+
+    def test_failed_refresh_raises_after_stale_window_cutoff(self) -> None:
+        # Past lifespan + stale_ttl the old key set is no longer trusted,
+        # even while the endpoint keeps failing: revoked keys have a hard
+        # trust boundary.
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=20, age=31)
+
+        with pytest.raises(PyJWKClientConnectionError):
+            with mocked_failed_response() as call:
+                jwks_client.get_jwk_set()
+
+        assert call.call_count == 1
+
+    def test_invalid_response_does_not_replace_usable_set(self) -> None:
+        # A 200 response whose body is not a JSON object is an invalid
+        # response. It must neither overwrite the cache nor reject tokens
+        # while the stale set is still inside its trust window.
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=20, age=15)
+
+        with mocked_success_response(["not", "an", "object"]) as call:
+            jwk_set = jwks_client.get_jwk_set()
+
+        assert call.call_count == 1
+        assert jwk_set[kid].key_id == kid
+
+    def test_stale_fallback_does_not_serve_when_disabled(self) -> None:
+        # Default stale_ttl of 0: once expired, a failed refresh propagates
+        # instead of extending trust in the old set.
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=0, age=11)
+
+        with pytest.raises(PyJWKClientConnectionError):
+            with mocked_failed_response() as call:
+                jwks_client.get_jwk_set()
+
+        assert call.call_count == 1
+
+    def test_recovered_endpoint_replaces_stale_set(self) -> None:
+        # Once the endpoint answers again, the fresh response replaces the
+        # stale set and normal fresh-cache behavior resumes.
+        new_kid = "ROTATED-KEY"
+        rotated = copy.deepcopy(RESPONSE_DATA_WITH_MATCHING_KID)
+        rotated["keys"][0]["kid"] = new_kid
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=20, age=15)
+
+        with mocked_success_response(rotated) as call:
+            jwk_set = jwks_client.get_jwk_set()
+
+        assert call.call_count == 1
+        assert [key.key_id for key in jwk_set.keys] == [new_kid]
+        # The new set is cached and served without another request.
+        with mocked_success_response(rotated) as repeated:
+            again = jwks_client.get_jwk_set()
+        assert repeated.call_count == 0
+        assert [key.key_id for key in again.keys] == [new_kid]
+
+    def test_outage_makes_one_request_per_cooldown_then_cuts_off(self) -> None:
+        # During an outage, repeated lookups against an expired cache must
+        # not hammer the endpoint: while the cooldown is in force the stale
+        # set is served with no request at all; once the cooldown elapses a
+        # single retry is allowed. After the stale window's hard cutoff the
+        # connection error propagates instead.
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = self._client_with_aged_cache(
+            lifespan=10, stale_ttl=20, age=15, cooldown_duration=30
+        )
+        # Let the first expired read attempt a refresh immediately.
+        jwks_client._last_refresh_attempt = None
+
+        with mocked_failed_response() as failing:
+            jwk_set = jwks_client.get_jwk_set()
+            assert jwk_set[kid].key_id == kid
+            # Further reads inside the cooldown make no further requests.
+            for _ in range(3):
+                jwk_set = jwks_client.get_jwk_set()
+                assert jwk_set[kid].key_id == kid
+        assert failing.call_count == 1
+
+        # After the cooldown elapses, exactly one retry is permitted.
+        jwks_client._last_refresh_attempt = time.monotonic() - 31
+        with mocked_failed_response() as retried:
+            jwk_set = jwks_client.get_jwk_set()
+        assert retried.call_count == 1
+        assert jwk_set[kid].key_id == kid
+
+        # Past the hard cutoff (10 + 20 = 30): trust is revoked.
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.jwk_set_with_timestamp is not None
+        jwks_client.jwk_set_cache.jwk_set_with_timestamp.timestamp = (
+            time.monotonic() - 31
+        )
+        jwks_client._last_refresh_attempt = time.monotonic() - 31
+        with pytest.raises(PyJWKClientConnectionError):
+            with mocked_failed_response() as cut_off:
+                jwks_client.get_jwk_set()
+        assert cut_off.call_count == 1
+
+    def test_failed_forced_refresh_restarts_cooldown(self) -> None:
+        # An unknown kid forces a refresh; when that refresh fails, the
+        # attempt itself starts the cooldown so repeated unknown-kid
+        # lookups do not produce another request until it elapses.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "unknown-kid"
+        jwks_client = PyJWKClient(url, lifespan=10, stale_ttl=20, cooldown_duration=30)
+
+        with mocked_success_response(RESPONSE_DATA_NO_MATCHING_KID):
+            with pytest.raises(PyJWKClientError, match="matches"):
+                jwks_client.get_signing_key(kid)
+        # No refresh was needed on the first fetch; reset the cooldown so
+        # the next unknown-kid lookup is allowed to force one.
+        jwks_client._last_refresh_attempt = None
+
+        with mocked_failed_response() as failing:
+            with pytest.raises(PyJWKClientError, match="matches"):
+                jwks_client.get_signing_key(kid)
+            assert failing.call_count == 1
+            # Cooldown is now in force: no more requests for unknown kids.
+            for _ in range(3):
+                with pytest.raises(PyJWKClientError, match="matches"):
+                    jwks_client.get_signing_key(kid)
+            assert failing.call_count == 1
+
+        # Once the cooldown elapses, one more attempt is allowed.
+        jwks_client._last_refresh_attempt = time.monotonic() - 31
+        with mocked_failed_response() as retried:
+            with pytest.raises(PyJWKClientError, match="matches"):
+                jwks_client.get_signing_key(kid)
+        assert retried.call_count == 1
+
+    def test_unknown_kid_served_from_stale_set_during_outage(self) -> None:
+        # A token signed with a key the cached set already knows must still
+        # verify during an outage after expiry, within the trust window.
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+        jwks_client = self._client_with_aged_cache(lifespan=10, stale_ttl=20, age=15)
+
+        with mocked_failed_response() as call:
+            signing_key = jwks_client.get_signing_key(kid)
+
+        assert call.call_count == 1
+        assert signing_key.key_id == kid
+
+    def test_concurrent_expired_refresh_runs_once_and_serves_stale(self) -> None:
+        # When several threads hit an expired cache while the endpoint is
+        # down, exactly one fetch is made and every caller receives the
+        # stale set within its trust window: the lock serializes the
+        # refresh and the cooldown blocks the waiters.
+        jwks_client = self._client_with_aged_cache(
+            lifespan=10, stale_ttl=20, age=15, cooldown_duration=30
+        )
+        assert jwks_client.jwk_set_cache is not None
+        jwks_client._last_refresh_attempt = None
+        refresh_started = threading.Event()
+        release_refresh = threading.Event()
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            opener = build_opener_mock.return_value
+
+            def failing_open(*args: object, **kwargs: object) -> mock.Mock:
+                refresh_started.set()
+                release_refresh.wait(timeout=5)
+                raise URLError("Fail to process the request.")
+
+            opener.open.side_effect = failing_open
+            results: list[PyJWKSet] = []
+            errors: list[Exception] = []
+
+            def lookup() -> None:
+                try:
+                    results.append(jwks_client.get_jwk_set())
+                except Exception as error:  # noqa: BLE001 - recorded for assert
+                    errors.append(error)
+
+            threads = [threading.Thread(target=lookup) for _ in range(4)]
+            for thread in threads:
+                thread.start()
+            assert refresh_started.wait(timeout=5)
+            release_refresh.set()
+            for thread in threads:
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+
+        assert opener.open.call_count == 1
+        assert errors == []
+        assert len(results) == 4
+        assert all(isinstance(result, PyJWKSet) for result in results)
+
     def test_failed_request_should_raise_connection_error(self) -> None:
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
@@ -645,6 +915,10 @@ class TestPyJWKClient:
             opener.open.return_value = response
             jwks_client.get_jwk_set()
             jwks_client._last_successful_fetch = 0
+            # The cooldown is measured from the last fetch *attempt*; put
+            # it outside the cooldown window so the unknown kid can force a
+            # refresh under the mocked clock.
+            jwks_client._last_refresh_attempt = 0
 
             def open_response(*args: object, **kwargs: object) -> mock.Mock:
                 if opener.open.call_count == 1:
