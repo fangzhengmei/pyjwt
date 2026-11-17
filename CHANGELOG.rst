@@ -14,6 +14,24 @@ Changed
   ES256 tokens, including rejection of tampered payloads and signatures,
   in `#1211 <https://github.com/jpadilla/pyjwt/pull/1211>`__.
 
+Security
+~~~~~~~~
+
+- ``PyJWKClient`` now reports a redirect as
+  ``PyJWKClientRedirectError`` (a ``PyJWKClientConnectionError`` subclass)
+  instead of an opaque HTTP error, and documents that redirects are never
+  followed, so custom request headers are only ever sent to the configured
+  JWKS URL.
+- ``PyJWKClient`` accepts a ``max_response_size`` budget (default 1 MiB) and
+  raises ``PyJWKClientResponseSizeError`` for a body over that limit. The
+  budget is enforced while reading, so an oversized or chunked response is
+  never fully buffered, parsed, or cached.
+- A JWKS response that is not valid JSON now raises ``PyJWKClientError``
+  rather than leaking ``ValueError``/``RecursionError``. Redirects,
+  oversized bodies, and malformed responses all leave the existing JWK Set
+  cache untouched, so a previously trusted key set and its ``lifespan`` /
+  ``cooldown_duration`` policy stay in effect and explainable.
+
 `v2.15.1 <https://github.com/jpadilla/pyjwt/compare/2.15.0...2.15.1>`__
 -----------------------------------------------------------------------
 

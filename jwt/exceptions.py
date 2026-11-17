@@ -101,6 +101,22 @@ class PyJWKClientConnectionError(PyJWKClientError):
     pass
 
 
+class PyJWKClientRedirectError(PyJWKClientConnectionError):
+    """Raised when the JWKS endpoint answers with a redirect.
+
+    Redirects are never followed, so the ``Location`` target is never
+    contacted and the configured request headers are never sent there.
+    """
+
+    pass
+
+
+class PyJWKClientResponseSizeError(PyJWKClientError):
+    """Raised when a JWKS response body exceeds the configured size budget."""
+
+    pass
+
+
 class InvalidSubjectError(InvalidTokenError):
     """Raised when a token's ``sub`` claim is not a string or doesn't match the expected ``subject``"""
 

@@ -518,6 +518,46 @@ an error.
 requests. See :class:`~jwt.PyJWKClient` in the API reference for details on
 the caching parameters.
 
+Redirects, response size and header scope
+-----------------------------------------
+
+Only a response read directly from the configured JWKS URL can become a
+trusted key set:
+
+- **Redirects are never followed.** A ``3xx`` response raises
+  :class:`~jwt.PyJWKClientRedirectError`, which is a subclass of
+  :class:`~jwt.PyJWKClientConnectionError`. The ``Location`` target is never
+  contacted, even when it points at the same origin, so a redirect cannot
+  substitute a different body for the configured endpoint.
+- **Custom headers go only to the configured URL.** Because no redirect is
+  followed, the ``headers`` passed to ``PyJWKClient`` (which commonly carry
+  an API key or ``Authorization`` value) are sent to the configured ``uri``
+  and nowhere else. There is no same-origin exemption and no propagation
+  across schemes or hosts.
+- **Responses over budget are rejected before parsing.** ``max_response_size``
+  (default 1 MiB) caps how much of the body is read. An over-budget response
+  raises :class:`~jwt.PyJWKClientResponseSizeError` and is never parsed or
+  cached. The cap applies whether or not the server sends a
+  ``Content-Length`` header.
+
+A failed fetch of any kind -- redirect, oversized body, timeout, connection
+error, or malformed JSON -- leaves the existing cache untouched. Previously
+fetched keys keep being served according to the configured ``lifespan`` and
+``cooldown_duration`` policy, so one bad response cannot silently replace,
+weaken, or clear the keys already in use.
+
+.. code-block:: python
+
+    client = PyJWKClient(
+        "https://issuer.example/.well-known/jwks.json",
+        max_response_size=512 * 1024,
+        headers={"Authorization": "Bearer endpoint-scoped-token"},
+    )
+
+The ``ssl_context`` parameter is unchanged and is still passed to the
+``urllib`` HTTPS handler, so applications that configure a private CA,
+client certificate, or a stricter TLS policy keep the same behavior.
+
 OIDC Login Flow
 ---------------
 

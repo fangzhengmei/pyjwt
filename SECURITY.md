@@ -116,6 +116,15 @@ destination, and protecting any surrounding proxy or cache. Applications must
 confine key selection based on an attacker-controlled `kid` to a JWKS they have
 independently chosen to trust.
 
+`PyJWKClient` itself does not follow redirects: a `3xx` response is reported as
+`PyJWKClientRedirectError` and the redirect target is never contacted, so
+caller-supplied headers are only sent to the configured URL. It also rejects a
+response body larger than `max_response_size` (default 1 MiB) with
+`PyJWKClientResponseSizeError` before parsing it. Neither a redirect nor an
+over-budget, malformed, or failed response replaces a previously cached JWK Set.
+Choosing an appropriate budget, and trusting the endpoint and any proxy in front
+of it, remains an application responsibility.
+
 #### Key Material
 
 PyJWT assumes that keys and secrets supplied by the application are authentic,
@@ -133,11 +142,12 @@ recommendation for every supported algorithm.
 #### Input and Resource Limits
 
 PyJWT does not generally impose hard size or complexity limits on tokens,
-payloads, headers, keys, or JWKS documents. Applications must limit
-attacker-controlled input sizes, request rates, remote-response sizes, and
-resource consumption as appropriate for their environment. PyJWT remains
-responsible for avoiding unnecessary or disproportionate work while processing
-those inputs.
+payloads, headers, keys, or inline JWKS documents. Applications must limit
+attacker-controlled input sizes, request rates, and resource consumption as
+appropriate for their environment. The one exception is a JWKS response fetched
+by `PyJWKClient`, which is capped by `max_response_size` (default 1 MiB) before
+it is parsed. PyJWT remains responsible for avoiding unnecessary or
+disproportionate work while processing those inputs.
 
 #### Side Channels
 

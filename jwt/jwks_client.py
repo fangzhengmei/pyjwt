@@ -14,8 +14,18 @@ from urllib.parse import urlparse
 
 from .api_jwk import PyJWK, PyJWKSet
 from .api_jwt import decode_complete as decode_token
-from .exceptions import PyJWKClientConnectionError, PyJWKClientError
+from .exceptions import (
+    PyJWKClientConnectionError,
+    PyJWKClientError,
+    PyJWKClientRedirectError,
+    PyJWKClientResponseSizeError,
+)
 from .jwk_set_cache import JWKSetCache
+
+# A JWK Set is normally a few kilobytes. The default budget is generous enough
+# for large providers (certificate chains included) while still bounding the
+# work a hostile or misconfigured endpoint can cause.
+_DEFAULT_MAX_RESPONSE_SIZE = 1024 * 1024
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -28,6 +38,14 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         headers: Any,
         newurl: str,
     ) -> urllib.request.Request | None:
+        # Returning ``None`` tells ``urllib`` that no handler will follow the
+        # redirect, so the 3xx response surfaces as an HTTPError instead of a
+        # request to ``newurl``. This is deliberately unconditional: the
+        # redirect target is outside the trust boundary configured by the
+        # caller, and the custom request headers (which may carry credentials)
+        # must only ever be sent to the configured JWKS URI. Because no new
+        # request is ever built, there is no "same-origin" or cross-origin
+        # header propagation to reason about: redirects never receive headers.
         return None
 
 
@@ -43,6 +61,7 @@ class PyJWKClient:
         timeout: float = 30,
         ssl_context: SSLContext | None = None,
         cooldown_duration: float = 30,
+        max_response_size: int = _DEFAULT_MAX_RESPONSE_SIZE,
     ):
         """A client for retrieving signing keys from a JWKS endpoint.
 
@@ -77,6 +96,18 @@ class PyJWKClient:
         - ``max_cached_keys``: Maximum number of signing keys to keep in
           the LRU cache. Defaults to ``16``.
 
+        **Transport boundaries:**
+
+        Redirects are never followed. A ``3xx`` response from the endpoint is
+        rejected before the destination is contacted, so a redirected body can
+        never be treated as a trusted key set, and the caller-supplied
+        ``headers`` are only ever sent to the configured ``uri``.
+
+        Responses larger than ``max_response_size`` are rejected before they
+        are parsed, and only a response that is both complete and within that
+        budget can replace the cached JWK Set. A rejected or failed fetch
+        leaves any existing cached set untouched.
+
         :param uri: The URL of the JWKS endpoint.
         :type uri: str
         :param cache_keys: Enable the per-key LRU cache (Tier 2).
@@ -96,6 +127,11 @@ class PyJWKClient:
         :param cooldown_duration: Minimum time in seconds between forced
             refreshes after an unknown key ID. Defaults to ``30``.
         :type cooldown_duration: float
+        :param max_response_size: Maximum accepted size in bytes of the JWKS
+            response body. Responses above the limit raise
+            ``PyJWKClientResponseSizeError`` and never reach the cache.
+            Defaults to ``1048576`` (1 MiB).
+        :type max_response_size: int
         """
         if headers is None:
             headers = {}
@@ -124,6 +160,16 @@ class PyJWKClient:
                 f'Cooldown duration must be finite, the input is "{cooldown_duration}"'
             )
         self.cooldown_duration = cooldown_duration
+        if (
+            isinstance(max_response_size, bool)
+            or not isinstance(max_response_size, int)
+            or max_response_size <= 0
+        ):
+            raise PyJWKClientError(
+                "Max response size must be a positive integer, "
+                f'the input is "{max_response_size}"'
+            )
+        self.max_response_size = max_response_size
         self._last_successful_fetch: float | None = None
         self._client_lock = threading.RLock()
 
@@ -144,6 +190,27 @@ class PyJWKClient:
             # Ignore mypy (https://github.com/python/mypy/issues/2427)
             self.get_signing_key = get_signing_key  # type: ignore[method-assign]
 
+    def _read_response_body(self, response: Any) -> bytes:
+        """Read the response body, enforcing ``max_response_size``.
+
+        At most ``max_response_size + 1`` bytes are requested, so a body that
+        exceeds the budget is detected without buffering all of it. The body
+        is never returned in that case, which keeps it out of the JWK Set
+        cache.
+
+        :raises PyJWKClientResponseSizeError: If the body is over budget.
+        """
+        body = response.read(self.max_response_size + 1)
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        body = bytes(body)
+        if len(body) > self.max_response_size:
+            raise PyJWKClientResponseSizeError(
+                "The JWKS endpoint response exceeds the configured size "
+                f"limit of {self.max_response_size} bytes"
+            )
+        return body
+
     def fetch_data(self) -> Any:
         """Fetch the JWK Set from the JWKS endpoint.
 
@@ -151,8 +218,21 @@ class PyJWKClient:
         parsed JSON response. If the JWK Set cache is enabled, the
         response is stored in the cache.
 
+        Only a response that was received from the configured ``uri``,
+        within ``max_response_size``, and parsed as a JSON object is cached.
+        A redirect, an oversized body, a transport failure, or malformed
+        JSON raises instead, and any previously cached JWK Set is left
+        untouched so a failed refresh cannot weaken or clear the trust
+        policy that was already in effect.
+
         :returns: The parsed JWK Set as a dictionary.
-        :raises PyJWKClientConnectionError: If the HTTP request fails.
+        :raises PyJWKClientRedirectError: If the endpoint answers with a
+            redirect. The redirect target is never contacted and the
+            configured ``headers`` are never sent to it.
+        :raises PyJWKClientResponseSizeError: If the response body exceeds
+            ``max_response_size`` bytes.
+        :raises PyJWKClientConnectionError: If the HTTP request fails for
+            any other reason.
         :raises PyJWKClientError: If the endpoint does not return a JSON
             object.
         :raises PyJWKSetError: If the JWK Set cache is enabled and the
@@ -165,13 +245,35 @@ class PyJWKClient:
                 handlers.append(urllib.request.HTTPSHandler(context=self.ssl_context))
             opener = urllib.request.build_opener(*handlers)
             with opener.open(r, timeout=self.timeout) as response:
-                jwk_set = json.load(response)
-        except (URLError, TimeoutError, http.client.HTTPException) as e:
-            if isinstance(e, HTTPError):
-                e.close()
+                body = self._read_response_body(response)
+        except HTTPError as e:
+            e.close()
+            # _NoRedirectHandler surfaces a 3xx as an HTTPError rather than
+            # following it. Report that distinctly so callers can tell a
+            # misconfigured or hostile endpoint from a transient outage.
+            if 300 <= e.code < 400:
+                raise PyJWKClientRedirectError(
+                    "The JWKS endpoint responded with a redirect "
+                    f"(HTTP {e.code}); redirects are not followed"
+                ) from e
             raise PyJWKClientConnectionError(
                 f'Fail to fetch data from the url, err: "{e}"'
             ) from e
+        except (URLError, TimeoutError, http.client.HTTPException) as e:
+            raise PyJWKClientConnectionError(
+                f'Fail to fetch data from the url, err: "{e}"'
+            ) from e
+
+        # Parsing is kept outside the network-error handler so a malformed
+        # body is reported as such, never as an unreachable endpoint.
+        try:
+            jwk_set = json.loads(body)
+        except (ValueError, RecursionError) as e:
+            # json.loads() raises ValueError (JSONDecodeError,
+            # UnicodeDecodeError) and, for deeply nested input,
+            # RecursionError. Neither is a documented PyJWT error, and
+            # neither may be mistaken for a successful fetch.
+            raise PyJWKClientError("The JWKS endpoint did not return valid JSON") from e
 
         # Validate the payload before it reaches the cache, so an endpoint
         # returning something that isn't a JSON object is reported as such

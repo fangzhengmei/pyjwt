@@ -23,6 +23,8 @@ from jwt.exceptions import (
     DecodeError,
     PyJWKClientConnectionError,
     PyJWKClientError,
+    PyJWKClientRedirectError,
+    PyJWKClientResponseSizeError,
     PyJWKSetError,
 )
 from jwt.jwk_set_cache import JWKSetCache
@@ -149,41 +151,58 @@ def mocked_http_error_response() -> Iterator[tuple[mock.Mock, HTTPError]]:
         yield urlopen_mock, http_error
 
 
+@contextlib.contextmanager
+def jwks_http_server(
+    handler_cls: type[BaseHTTPRequestHandler],
+) -> Iterator[str]:
+    """Serve *handler_cls* on a loopback port and yield its base URL."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+class _QuietHandler(BaseHTTPRequestHandler):
+    """Loopback test handler that keeps the test log quiet."""
+
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
+        return
+
+
 @crypto_required
 class TestPyJWKClient:
     def test_fetch_data_rejects_redirect_without_contacting_destination(self) -> None:
         destination_requests = 0
+        destination_headers: list[str] = []
 
-        class RedirectHandler(BaseHTTPRequestHandler):
+        class RedirectHandler(_QuietHandler):
             def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
                 nonlocal destination_requests
                 if self.path == "/start":
                     self.send_response(302)
-                    self.send_header("Location", f"{base_url}/destination")
+                    self.send_header("Location", "/destination")
                     self.end_headers()
                 else:
                     destination_requests += 1
+                    destination_headers.append(self.headers.get("Authorization", ""))
                     self.send_response(200)
                     self.end_headers()
 
-            def log_message(self, _format: str, *args: object) -> None:
-                return
-
-        server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectHandler)
-        base_url = f"http://127.0.0.1:{server.server_port}"
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        try:
+        with jwks_http_server(RedirectHandler) as base_url:
             client = PyJWKClient(
                 f"{base_url}/start", headers={"Authorization": "secret"}
             )
-            with pytest.raises(PyJWKClientConnectionError):
+            with pytest.raises(PyJWKClientRedirectError) as exc:
                 client.fetch_data()
-            assert destination_requests == 0
-        finally:
-            server.shutdown()
-            server.server_close()
-            thread.join()
+
+        assert destination_requests == 0
+        assert destination_headers == []
+        assert "redirect" in str(exc.value).lower()
 
     def test_redirect_handler_does_not_follow_redirects(self) -> None:
         handler = _NoRedirectHandler()
@@ -194,6 +213,225 @@ class TestPyJWKClient:
             )
             is None
         )
+
+    @pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+    def test_redirect_response_is_reported_as_redirect_error(self, code: int) -> None:
+        # Every redirect status is rejected before the target is contacted,
+        # including a same-origin target, so a redirect can never substitute
+        # an attacker-chosen body for the configured endpoint.
+        destination_requests = 0
+
+        class SameOriginRedirectHandler(_QuietHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                nonlocal destination_requests
+                if self.path == "/start":
+                    self.send_response(code)
+                    self.send_header("Location", "/jwks.json")
+                    self.end_headers()
+                else:
+                    destination_requests += 1
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(
+                        json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+                    )
+
+        with jwks_http_server(SameOriginRedirectHandler) as base_url:
+            client = PyJWKClient(f"{base_url}/start")
+            with pytest.raises(PyJWKClientRedirectError):
+                client.get_jwk_set()
+
+        assert destination_requests == 0
+        assert client.jwk_set_cache is not None
+        assert client.jwk_set_cache.get() is None
+
+    def test_redirect_error_is_a_connection_error(self) -> None:
+        # Compatibility: callers that only handled the previous
+        # PyJWKClientConnectionError on redirect keep working.
+        assert issubclass(PyJWKClientRedirectError, PyJWKClientConnectionError)
+
+    def test_redirect_does_not_replace_a_cached_jwk_set(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            cached = jwks_client.get_jwk_set()
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            build_opener_mock.return_value.open.side_effect = HTTPError(
+                url="https://elsewhere.test/jwks.json",
+                code=302,
+                msg="Found",
+                hdrs=Message(),
+                fp=io.BytesIO(b""),
+            )
+            with pytest.raises(PyJWKClientRedirectError):
+                jwks_client.get_jwk_set(refresh=True)
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is cached
+
+    def test_oversized_response_is_rejected_before_parsing(self) -> None:
+        body = b'{"keys": []}' + b" " * 64
+
+        class OversizedHandler(_QuietHandler):
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        with jwks_http_server(OversizedHandler) as base_url:
+            client = PyJWKClient(f"{base_url}/jwks.json", max_response_size=16)
+            with pytest.raises(PyJWKClientResponseSizeError) as exc:
+                client.get_jwk_set()
+
+        assert "16" in str(exc.value)
+        assert client.jwk_set_cache is not None
+        assert client.jwk_set_cache.get() is None
+
+    def test_size_limit_is_inclusive(self) -> None:
+        # A body exactly at the budget is accepted; one byte over is not.
+        payload = json.dumps(RESPONSE_DATA_WITH_MATCHING_KID).encode()
+        limit = len(payload)
+        observed: list[bytes] = []
+
+        class ExactSizeHandler(_QuietHandler):
+            extra = b""
+
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                body = payload + self.extra
+                observed.append(body)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        with jwks_http_server(ExactSizeHandler) as base_url:
+            client = PyJWKClient(f"{base_url}/jwks.json", max_response_size=limit)
+            jwk_set = client.get_jwk_set()
+
+        assert len(jwk_set.keys) == 1
+        assert len(observed[0]) == limit
+
+        class OneOverHandler(ExactSizeHandler):
+            extra = b" "
+
+        with jwks_http_server(OneOverHandler) as base_url:
+            client = PyJWKClient(f"{base_url}/jwks.json", max_response_size=limit)
+            with pytest.raises(PyJWKClientResponseSizeError):
+                client.get_jwk_set()
+
+    def test_partial_read_before_limit_is_a_connection_error(self) -> None:
+        # The size budget must not mask a truncated body: a response that
+        # ends early is still a connection failure, not a size rejection.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url, max_response_size=4096)
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=False)
+            response.read.side_effect = http.client.IncompleteRead(
+                partial=b"partial", expected=10
+            )
+            build_opener_mock.return_value.open.return_value = response
+
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.fetch_data()
+
+    def test_oversized_response_without_content_length_is_rejected(self) -> None:
+        # A chunked/streamed body cannot dodge the budget by omitting
+        # Content-Length: reading stops after max_response_size + 1 bytes.
+        body = b'{"padding": "' + b"A" * 4096 + b'"}'
+
+        class ChunkedHandler(_QuietHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self) -> None:  # noqa: N802 - stdlib handler API
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                for start in range(0, len(body), 512):
+                    chunk = body[start : start + 512]
+                    self.wfile.write(f"{len(chunk):x}\r\n".encode())
+                    self.wfile.write(chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+
+        with jwks_http_server(ChunkedHandler) as base_url:
+            client = PyJWKClient(f"{base_url}/jwks.json", max_response_size=128)
+            with pytest.raises(PyJWKClientResponseSizeError):
+                client.get_jwk_set()
+
+    def test_oversized_response_does_not_replace_a_cached_jwk_set(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url, max_response_size=1024)
+        seeded = PyJWKSet.from_dict(RESPONSE_DATA_WITH_MATCHING_KID)
+        assert jwks_client.jwk_set_cache is not None
+        jwks_client.jwk_set_cache.put(seeded)
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=False)
+            response.read.return_value = b"x" * 2048
+            build_opener_mock.return_value.open.return_value = response
+
+            with pytest.raises(PyJWKClientResponseSizeError):
+                jwks_client.get_jwk_set(refresh=True)
+
+        assert jwks_client.jwk_set_cache.get() is seeded
+
+    def test_failed_fetch_leaves_cache_policy_intact(self) -> None:
+        # After every failure mode, the cached set -- and therefore the
+        # explainable trust policy -- is still served without a new request.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url, max_response_size=10_000)
+        with mocked_success_response(RESPONSE_DATA_NO_MATCHING_KID):
+            first = jwks_client.get_jwk_set()
+
+        def failing_open(*args: Any, **kwargs: Any) -> Any:
+            raise URLError("outage")
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            build_opener_mock.return_value.open.side_effect = failing_open
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.get_jwk_set(refresh=True)
+
+        # A cache read must not hit the network at all.
+        assert jwks_client.get_jwk_set() is first
+
+    def test_invalid_json_is_reported_as_client_error(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        jwks_client = PyJWKClient(url)
+
+        with mock.patch("urllib.request.build_opener") as build_opener_mock:
+            response = mock.Mock()
+            response.__enter__ = mock.Mock(return_value=response)
+            response.__exit__ = mock.Mock(return_value=False)
+            response.read.return_value = b"{not json"
+            build_opener_mock.return_value.open.return_value = response
+
+            with pytest.raises(PyJWKClientError, match="valid JSON"):
+                jwks_client.fetch_data()
+
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is None
+
+    @pytest.mark.parametrize("value", [0, -1, 1.5, "1024", True, None])
+    def test_max_response_size_must_be_a_positive_int(self, value: Any) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        with pytest.raises(PyJWKClientError, match="Max response size"):
+            PyJWKClient(url, max_response_size=value)
+
+    def test_default_max_response_size_is_one_mebibyte(self) -> None:
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+        assert PyJWKClient(url).max_response_size == 1024 * 1024
 
     def test_fetch_data_forwards_headers_to_correct_url(self) -> None:
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"

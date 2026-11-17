@@ -18,7 +18,9 @@ image), which is the authoritative version and has more detail.
   implement their primitives correctly.
 - PyJWT does not impose hard size limits on input; applications limit input
   size and request rates. PyJWT is still responsible for not doing
-  unnecessary or disproportionate work.
+  unnecessary or disproportionate work. Remote JWKS bodies fetched by
+  `PyJWKClient` are the exception: they are capped by `max_response_size`
+  (default 1 MiB) before parsing, and redirects are never followed.
 
 ## What PyJWT guarantees when configured correctly
 
